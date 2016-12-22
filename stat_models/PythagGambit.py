@@ -135,7 +135,7 @@ class PythagGambit(object):
 					self.prepare_bet(gid,away_team,-self.diff_thresh-xDiff)
 
 			curr_date = int((datetime.strptime(str(curr_date),'%Y%m%d') + timedelta(1)).strftime('%Y%m%d'))
-
+			
 
 
 if __name__ == "__main__":

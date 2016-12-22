@@ -1,37 +1,57 @@
 import MySQLdb, re, time, sys, math, signal
 from datetime import date, timedelta, datetime
+from config import CONFIG as config
 import numpy as np
 import GamesByDate
 import HalcyonNHLdb
 import pandas as pd
-pd.set_option('display.height', 1000)
 pd.set_option('display.max_rows', 500)
-pd.set_option('display.max_columns', 60)
+pd.set_option('display.max_columns', 20)
 pd.set_option('display.width', 1000)
 
 from config import CONFIG as config
 
 
-
 class Elo(object):
 
-	def __init__(self,season,start_date,end_date,prev_elo):
+	def __init__(self,season,start_date,end_date,prev_elo,opt_mode=False,K=15,home_bias=30,norm=400,reg_frac=1./3):
 		self.db = HalcyonNHLdb.HalcyonNHLdb()
-		self.season = season
-		self.start_date = start_date
-		self.end_date = end_date
+		self.season = int(season)
+		self.start_date = int(start_date)
+		self.end_date = int(end_date)
+		self.last_date = 0
 		self.gbd = GamesByDate.GamesByDate(self.season).gbd
 		self.season_df = self.retrieve_season_results()
 
-		self.init_elo_df = self.retrieve_initial_elo(prev_elo)
-		print "\nOriginal ELO ratings for ", self.season, "\n"
-		print self.init_elo_df
+		# opt_mode =True => parameters being optimized on season prior to actual target season
+		# opt_mode =False => Elo being computed with specified parameters on target games
+		self.opt_mode = opt_mode
+		if self.opt_mode:
+			self.expected_result = []
+			self.actual_result = []
 
-		self.K = 20
-		self.home_bias = 50
+		self.init_elo_df = self.retrieve_initial_elo(prev_elo)
+
+		self.K = K
+		self.home_bias = home_bias
+		self.norm = norm
+
+		self.reg_frac = reg_frac
+
+	def regress_elo(self,elo_df,frac):
+		reg_df = elo_df[[self.last_date]]-frac*(elo_df[[self.last_date]]-1505)
+		return reg_df
 
 	def save_elo(self,elo_df):
-		pass
+		# save entire elo_df in csv file
+		#print elo_df
+		full_outfile = "outfiles/daily_elo_{0}.csv".format(self.season)
+		elo_df.to_csv(full_outfile)
+		# regress final ratings 1/3 back towards 1505
+		final_df = elo_df[[self.last_date]]
+		reg_df = self.regress_elo(final_df,self.reg_frac)
+		final_outfile = "outfiles/final_reg_elo_{0}.csv".format(self.season)
+		reg_df.to_csv(final_outfile)
 
 	def retrieve_season_results(self):
 		query = "SELECT gameID, team, opponent, winner, loser, result, points, gameType, date FROM Games{0} WHERE location=\"home\" ORDER BY gameID ASC;".format(self.season)
@@ -40,10 +60,12 @@ class Elo(object):
 
 	def retrieve_initial_elo(self,prev_elo):
 		try:
-			elo_df = pd.read_csv(prev_elo,columns=config["teams"])
+			elo_df = pd.read_csv(prev_elo)
+			elo_df = elo_df.set_index(elo_df.columns[0])
 		except:
-			init_data = 1500*np.ones((1,len(config["teams"])))
-			elo_df = pd.DataFrame(init_data,index=np.arange(len(init_data)),columns=config["teams"])
+			init_date = "{0}_i".format(self.start_date)
+			init_data = 1500*np.ones((len(config["teams"]),1))
+			elo_df = pd.DataFrame(init_data,index=config["teams"],columns=[init_date])
 		return elo_df
 
 	def get_result(self,gid):
@@ -69,58 +91,73 @@ class Elo(object):
 	def get_teams(self,gid):
 		home = self.season_df["team"].loc[self.season_df["gameID"]==gid].item()
 		away = self.season_df["opponent"].loc[self.season_df["gameID"]==gid].item()
+		if home == "PHX": home = "ARI"
+		elif away == "PHX": away = "ARI"
+		if home == "ATL": home = "WPG"
+		elif away == "ATL": away = "WPG"
 		return home, away
 
 	def compute_home_expectation(self,elo_diff):
-		home_expect = 1./(10**(-elo_diff/400)+1)
+		home_expect = 1./(10**(-elo_diff/self.norm)+1)
 		#print "Expected home pct: ", home_expect
 		return home_expect
 
-	def update_elo(self,elo_df,home,away,result):
-		home_elo = elo_df[home].iloc[-1]
-		away_elo = elo_df[away].iloc[-1]
+	def update_elo(self,elo_df,curr_date,home,away,gid,result):
+		home_elo = elo_df[curr_date].ix[home]
+		away_elo = elo_df[curr_date].ix[away]
 
 		home_expected = self.compute_home_expectation(self.home_bias+home_elo-away_elo)
 		away_expected = 1-home_expected
+		if self.opt_mode: self.expected_result.append(home_expected)
 		
 		if result == 1:
-			new_home_elo = home_elo + self.K * (1 - home_expected)
-			new_away_elo = away_elo + self.K * (0 - away_expected)
+			home_actual = 1
+			new_home_elo = home_elo + self.K * (home_actual - home_expected)
+			new_away_elo = away_elo + self.K * ((1-home_actual) - away_expected)
 		elif result == 2:
-			new_home_elo = home_elo + self.K * (.8 - home_expected)
-			new_away_elo = away_elo + self.K * (.2 - away_expected)
+			home_actual = .8
+			new_home_elo = home_elo + self.K * (home_actual - home_expected)
+			new_away_elo = away_elo + self.K * ((1-home_actual) - away_expected)
 		elif result == 3:
-			new_home_elo = home_elo + self.K * (.6 - home_expected)
-			new_away_elo = away_elo + self.K * (.4 - away_expected)
+			home_actual = .6
+			new_home_elo = home_elo + self.K * (home_actual - home_expected)
+			new_away_elo = away_elo + self.K * ((1-home_actual) - away_expected)
 		elif result == 4:
-			new_home_elo = home_elo + self.K * (0 - home_expected)
-			new_away_elo = away_elo + self.K * (1 - away_expected)
+			home_actual = 0
+			new_home_elo = home_elo + self.K * (home_actual - home_expected)
+			new_away_elo = away_elo + self.K * ((1-home_actual) - away_expected)
 		elif result == 5:
-			new_home_elo = home_elo + self.K * (.2 - home_expected)
-			new_away_elo = away_elo + self.K * (.8 - away_expected)
+			home_actual = .2
+			new_home_elo = home_elo + self.K * (home_actual - home_expected)
+			new_away_elo = away_elo + self.K * ((1-home_actual) - away_expected)
 		elif result == 6:
-			new_home_elo = home_elo + self.K * (.4 - home_expected)
-			new_away_elo = away_elo + self.K * (.6 - away_expected)
+			home_actual = .4
+			new_home_elo = home_elo + self.K * (home_actual - home_expected)
+			new_away_elo = away_elo + self.K * ((1-home_actual) - away_expected)
 
-		elo_df[home].iloc[-1] = new_home_elo
-		elo_df[away].iloc[-1] = new_away_elo
+		if self.opt_mode: self.actual_result.append(home_actual)
+		
+		elo_df[curr_date].ix[home] = new_home_elo
+		elo_df[curr_date].ix[away] = new_away_elo
 		return elo_df
 
 	def execute(self):
 
 		curr_date = self.start_date
+		prev_date = self.init_elo_df.columns[0]
 		curr_elo_df = self.init_elo_df
 
 		while curr_date <= self.end_date:
 			# get gids for current date if they exist, else continue to next day
+
 			try:
 				gids = self.gbd[curr_date]
 			except:
 				curr_date = int((datetime.strptime(str(curr_date),'%Y%m%d') + timedelta(1)).strftime('%Y%m%d'))
 				continue
 
-			# since games exist on this day, add row to curr_elo_df for new ratings
-			curr_elo_df = curr_elo_df.append(curr_elo_df.iloc[[-1]], ignore_index=True)
+			# since games exist on this day, add col to curr_elo_df for new ratings
+			curr_elo_df[curr_date] = curr_elo_df[prev_date]
 
 			for gid in gids:
 				# get team names
@@ -128,18 +165,15 @@ class Elo(object):
 				# get game result
 				result = self.get_result(gid)
 				# update Elo
-				curr_elo_df = self.update_elo(curr_elo_df,home_team,away_team,result)
+				curr_elo_df = self.update_elo(curr_elo_df,curr_date,home_team,away_team,gid,result)
 
+			prev_date = curr_date
+			self.last_date = curr_date
 			curr_date = int((datetime.strptime(str(curr_date),'%Y%m%d') + timedelta(1)).strftime('%Y%m%d'))
 
-		print ""
-		ratings_df = curr_elo_df.iloc[-1]
-		ratings_df.columns = ['Team', 'Rating']
+		curr_elo_df.index.names = ['Team']
+		return curr_elo_df
 
-		print ratings_df.sort('Rating',ascending=False)
-
-		print "\nFinal Elo ratings for ", self.season, "\n"
-		print curr_elo_df.iloc[-1]
 
 if __name__ == "__main__":
 	try:
